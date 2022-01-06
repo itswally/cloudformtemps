@@ -1,0 +1,218 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+    Deploy Config Rule and SSM document to remediate AWS Aurora encyption in
+    transit for PostgreSQL engines. The S3 key is a reference to a zipped python
+    file lambda function. The Lambda functions runs under a role created by this
+    cloudformation. The SSM automation document. This assumes that AWS Config
+    has previously been set up and configured and we are only adding a rule and
+    remediation. The SSM document runs a python script, included in this template.
+    Can only create one stack since the names are not stack based or dynamic.
+
+Parameters:
+    Frequency:
+        Type: String
+        Default: TwentyFour_Hours
+        AllowedValues:
+            - One_Hour
+            - Six_Hours
+            - Three_Hours
+            - Twelve_Hours
+            - TwentyFour_Hours
+        Description: The periodic frequency to run the Config Rule. Valid values are One_Hour | Six_Hours | Three_Hours | Twelve_Hours | TwentyFour_Hours
+
+    S3BucketName:
+        Type: String
+        MinLength: 3
+        MaxLength: 63
+        AllowedPattern: ^[0-9A-Za-z\.\-_]*(?<!\.)$
+        Description: The S3 Bucket name where the Lambda function is located.
+
+    S3Key:
+        Type: String
+        MinLength: 1
+        MaxLength: 1024
+        Description: The S3 Key where the Lambda function is located.
+
+Resources:
+    AuroraPostgreSQLEncryptedInTransitLambdaRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                        Service:
+                            - lambda.amazonaws.com
+                      Action:
+                        - 'sts:AssumeRole'
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+                - arn:aws:iam::aws:policy/AmazonRDSReadOnlyAccess
+                - arn:aws:iam::aws:policy/service-role/AWSConfigRulesExecutionRole
+
+    AuroraPostgreSQLEncryptedInTransitsSSMRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                        Service:
+                            - ssm.amazonaws.com
+                      Action:
+                        - 'sts:AssumeRole'
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/service-role/AmazonSSMAutomationRole
+                - arn:aws:iam::aws:policy/AmazonRDSFullAccess
+    
+    AuroraPostgreSQLEncryptedInTransitLambda:
+        Type: AWS::Lambda::Function
+        Properties:
+            Code:
+                S3Bucket: !Ref S3BucketName
+                S3Key: !Ref S3Key
+            Description: Function to evaluate if AuroraPostgreSQL is encrypted in transit.
+            FunctionName: AuroraPostgreSQLSSLInTransit
+            PackageType: Zip
+            Role: !GetAtt AuroraPostgreSQLEncryptedInTransitLambdaRole.Arn
+            Runtime: python3.8
+            Handler: RDSAuroraEnforceSSLInTransit.lambda_handler
+            Timeout: 30
+        DependsOn: AuroraPostgreSQLEncryptedInTransitLambdaRole
+
+    ConfigPermissionToCallLambda: 
+        Type: AWS::Lambda::Permission
+        Properties: 
+            FunctionName: !GetAtt AuroraPostgreSQLEncryptedInTransitLambda.Arn
+            Action: "lambda:InvokeFunction"
+            Principal: "config.amazonaws.com"
+        DependsOn: AuroraPostgreSQLEncryptedInTransitLambda
+
+    AuroraPostgreSQLEncryptedInTransit:
+        Type: AWS::Config::ConfigRule
+        Properties:
+            ConfigRuleName: AuroraPostgreSQLEncryptedInTransit
+            Description:
+                Checks an RDS Aurora PostgresSQL DB Cluster for encryption in transit. Looks for rds.force_ssl sest to '1' in DB Cluster Parameter Group.
+            MaximumExecutionFrequency: !Ref Frequency
+            Source:
+                Owner: CUSTOM_LAMBDA
+                SourceDetails:
+                    -
+                        EventSource: "aws.config"
+                        MessageType: "ScheduledNotification"
+                SourceIdentifier: !GetAtt AuroraPostgreSQLEncryptedInTransitLambda.Arn
+        DependsOn: ConfigPermissionToCallLambda
+
+    AuroraPostgreSQLForceSSL:
+        Type: AWS::SSM::Document
+        Properties:
+            DocumentType: Automation
+            Name: AuroraPostgreSQLForceSSL
+            TargetType: /AWS::RDS::DBCluster
+            Content:
+                description: |-
+                schemaVersion: '0.3'
+                assumeRole: !GetAtt AuroraPostgreSQLEncryptedInTransitsSSMRole.Arn
+                parameters:
+                  dbClusterName:
+                    type: String
+                    description: the input db cluster id
+                mainSteps:
+                  - name: runScript
+                    action: 'aws:executeScript'
+                    inputs:
+                        Runtime: python3.6
+                        Handler: script_handler
+                        Script: |+
+                            import boto3
+                            import botocore.exceptions
+
+                            def script_handler(event, context):
+                                print(event["dbClusterName"])
+                                client = boto3.client('rds')
+
+                                cluster = client.describe_db_clusters(
+                                          DBClusterIdentifier=event['dbClusterName']
+                                        )
+
+                                if len(cluster['DBClusters']) == 0:
+                                    return
+
+                                param_group = cluster['DBClusters'][0]['DBClusterParameterGroup']
+                                if param_group.startswith('default.'):
+                                    # create new param group
+                                    print(param_group)
+                                    engine = param_group[8:]
+                                    cluster_group_name = event['dbClusterName']+"ClusterParameterGroup"
+
+                                    created = False
+                                    counter = 1
+                                    while not created:
+                                        if counter > 1:
+                                            cluster_group_name = event['dbClusterName']+"-"+str(counter)+"-ClusterParameterGroup"
+                                        try :
+                                            response = client.create_db_cluster_parameter_group(
+                                                DBClusterParameterGroupName=cluster_group_name,
+                                                DBParameterGroupFamily=engine,
+                                                Description=engine+" with rds.force_ssl set to '1'",
+                                            )
+                                            created = True
+                                        except botocore.exceptions.ClientError as e:
+                                            exception_type = e.response['Error']['Code'].find('DBParameterGroupAlreadyExists')
+                                            print(e)
+                                            if exception_type != -1:
+                                                counter += 1
+                                                print("Aleady Exists.")
+                                            else:
+                                                exit(1)
+                    
+                                    client.modify_db_cluster_parameter_group(
+                                            DBClusterParameterGroupName=cluster_group_name,
+                                            Parameters=[
+                                                {
+                                                    'ParameterName': 'rds.force_ssl',
+                                                    'ParameterValue': '1',
+                                                    'ApplyMethod': 'immediate'
+                                                }
+                                                ]
+                                            )
+                                    client.modify_db_cluster(
+                                            DBClusterIdentifier=event['dbClusterName'],
+                                            ApplyImmediately=True,
+                                            DBClusterParameterGroupName=cluster_group_name
+                                            )
+
+                                else:
+                                    # set rds.force_ssl param to 1
+                                    client.modify_db_cluster_parameter_group(
+                                            DBClusterParameterGroupName=param_group,
+                                            Parameters=[
+                                                {
+                                                    'ParameterName': 'rds.force_ssl',
+                                                    'ParameterValue': '1',
+                                                    'ApplyMethod': 'immediate'
+                                                }
+                                                ]
+                                            )
+    
+                        InputPayload:
+                            dbClusterName: '{{ dbClusterName }}'
+        DependsOn: AuroraPostgreSQLEncryptedInTransitsSSMRole
+            
+
+    AuroraPostgreSQLEncryptedInTransitRemediation:
+        Type: AWS::Config::RemediationConfiguration
+        Properties:
+            Automatic: False
+            ConfigRuleName: AuroraPostgreSQLEncryptedInTransit
+            Parameters:
+                dbClusterName:
+                    ResourceValue:
+                        Value: RESOURCE_ID
+            TargetId: !Ref AuroraPostgreSQLForceSSL
+            TargetType: SSM_DOCUMENT
+            ResourceType: AWS::RDS::DBCluster
+        DependsOn: AuroraPostgreSQLEncryptedInTransit

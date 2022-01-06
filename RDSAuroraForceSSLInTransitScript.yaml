@@ -1,0 +1,87 @@
+description: |-
+schemaVersion: '0.3'
+assumeRole: 'arn:aws:iam::102492432743:role/SSMRole'
+parameters:
+  dbClusterName:
+    type: String
+    description: the input db cluster id
+mainSteps:
+  - name: runScript
+    action: 'aws:executeScript'
+    inputs:
+      Runtime: python3.6
+      Handler: script_handler
+      Script: |+
+        import boto3
+        import botocore.exceptions
+
+        def script_handler(event, context):
+          print(event["dbClusterName"])
+          client = boto3.client('rds')
+
+          cluster = client.describe_db_clusters(
+                  DBClusterIdentifier=event['dbClusterName']
+                  )
+
+          if len(cluster['DBClusters']) == 0:
+              return
+
+          param_group = cluster['DBClusters'][0]['DBClusterParameterGroup']
+          if param_group.startswith('default.'):
+            # create new param group
+            print(param_group)
+            engine = param_group[8:]
+            cluster_group_name = event['dbClusterName']+"ClusterParameterGroup"
+
+            created = False
+            counter = 1
+            while not created:
+              if counter > 1:
+                cluster_group_name = event['dbClusterName']+"-"+str(counter)+"-ClusterParameterGroup"
+              try :
+                response = client.create_db_cluster_parameter_group(
+                    DBClusterParameterGroupName=cluster_group_name,
+                    DBParameterGroupFamily=engine,
+                    Description=engine+" with rds.force_ssl set to '1'",
+                )
+                created = True
+              except botocore.exceptions.ClientError as e:
+                exception_type = e.response['Error']['Code'].find('DBParameterGroupAlreadyExists')
+                print(e)
+                if exception_type != -1:
+                  counter += 1
+                  print("Aleady Exists.")
+                else:
+                  exit(1)
+
+            client.modify_db_cluster_parameter_group(
+                    DBClusterParameterGroupName=cluster_group_name,
+                    Parameters=[
+                        {
+                            'ParameterName': 'rds.force_ssl',
+                            'ParameterValue': '1',
+                            'ApplyMethod': 'immediate'
+                        }
+                        ]
+                    )
+            client.modify_db_cluster(
+                    DBClusterIdentifier=event['dbClusterName'],
+                    ApplyImmediately=True,
+                    DBClusterParameterGroupName=cluster_group_name
+                    )
+
+          else:
+              # set rds.force_ssl param to 1
+              client.modify_db_cluster_parameter_group(
+                      DBClusterParameterGroupName=param_group,
+                      Parameters=[
+                          {
+                              'ParameterName': 'rds.force_ssl',
+                              'ParameterValue': '1',
+                              'ApplyMethod': 'immediate'
+                          }
+                          ]
+                      )
+
+      InputPayload:
+        dbClusterName: '{{ dbClusterName }}'

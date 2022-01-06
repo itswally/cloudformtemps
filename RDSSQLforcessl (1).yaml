@@ -1,0 +1,30 @@
+description: |-
+schemaVersion: '0.3'
+assumeRole: 'arn:aws:iam::102492432743:role/SSMRole'
+parameters:
+  rdsDBName:
+    type: String
+    description: The name of an SQL DB.
+mainSteps:
+  - name: GetDBParameterGroup
+    action: 'aws:executeAwsApi'
+    outputs:
+      - Name: rdsDBParameterGroupName
+        Type: String
+        Selector: '$.DB[0].DBParameterGroup'
+    inputs:
+      Service: rds
+      Api: DescribeDB
+      DBIdentifier: '{{ rdsDBName }}'
+    description: 'Get the associated DB Parameter Group Name.'
+  - name: ForceSSLInTransit
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: rds
+      Api: ModifyDBParameterGroup
+      DBParameterGroupName: '{{ GetDBParameterGroup.rdsDBParameterGroupName }}'
+      Parameters:
+        - ParameterName: rds.force_ssl
+          ParameterValue: '1'
+          ApplyMethod: immediate
+    description: 'set the rds.force_ssl parameter to ''1''.'
